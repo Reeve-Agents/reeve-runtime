@@ -7,7 +7,8 @@ Usage (cwd = bundle root, which contains ``reeve_runtime/`` and ``job/``)::
 Runs, in one process:
   1. the Builder's own unit tests (job/test_builder.py)
   2. the Auditor's independent spec (job/audit_cases.json) against job/rules.py
-  3. mutation testing: the same spec against every job/mutants/*.py
+  3. mutation testing: the same spec against every mutant in job/mutants/manifest.json
+     (sources inline, written to job/mutants/<id>.py here; older bundles ship the files)
   4. a full simulation of job/scenario.json plus constraint checks (job/constraints.json)
 Writes job/results.json and prints it. Exit code 0 even when checks fail;
 the verdict is decided by the Auditor on the host.
@@ -17,13 +18,21 @@ from __future__ import annotations
 import importlib.util
 import io
 import json
+import signal
 import sys
+import threading
 import unittest
 from pathlib import Path
 from typing import Any, Dict, List
 
 from .dispatch import check_constraints, simulate
 from .spec import run_cases
+
+MUTANT_TIMEOUT_S = 5.0
+
+
+class MutantTimeout(BaseException):
+    """Raised when one mutant runs too long. BaseException, so the per-case handler cannot swallow it."""
 
 
 def load_module(path: Path, name: str) -> Any:
@@ -33,6 +42,24 @@ def load_module(path: Path, name: str) -> Any:
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
+
+
+def run_mutant(path: Path, name: str, cases: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Load one mutant and replay the spec on it, with a time limit where the platform has SIGALRM."""
+    timed = hasattr(signal, "setitimer") and threading.current_thread() is threading.main_thread()
+    previous = None
+    if timed:
+        def expire(_signum, _frame):
+            raise MutantTimeout()
+
+        previous = signal.signal(signal.SIGALRM, expire)
+        signal.setitimer(signal.ITIMER_REAL, MUTANT_TIMEOUT_S)
+    try:
+        return run_cases(load_module(path, name), cases)
+    finally:
+        if timed:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, previous)
 
 
 def run_builder_tests(job: Path) -> Dict[str, Any]:
@@ -58,17 +85,21 @@ def main(argv: List[str]) -> int:
     survivors = []
     killed = 0
     for m in manifest:
+        path = mutants_dir / Path(m["file"]).name
+        if "source" in m:
+            path.write_text(m["source"])  # outside the try: a failed write is a broken job, not a caught defect
         try:
-            mod = load_module(mutants_dir / m["file"], "mutant_" + m["id"])
-            outcome = run_cases(mod, cases)
+            outcome = run_mutant(path, "mutant_" + m["id"], cases)
             is_killed = outcome["failed"] > 0
-        except Exception:
-            is_killed = True  # a mutant that cannot even load is detected
+        except (Exception, SystemExit, MutantTimeout):
+            is_killed = True  # a mutant that cannot load, crashes or never finishes is detected
         if is_killed:
             killed += 1
         else:
             survivors.append({"id": m["id"], "description": m["description"]})
-    results["mutation"] = {"total": len(manifest), "killed": killed, "survivors": survivors}
+    # inline_sources tells the Auditor this runtime wrote the sources it was sent; an older one would
+    # miss them and count every load error as a caught defect.
+    results["mutation"] = {"total": len(manifest), "killed": killed, "survivors": survivors, "inline_sources": True}
 
     scenario = json.loads((job / "scenario.json").read_text())
     sim = simulate(rules, scenario)
